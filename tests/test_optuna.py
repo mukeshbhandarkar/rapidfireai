@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import pytest
 import optuna
 
+from rapidfireai.automl import optuna_search
 from rapidfireai.automl.datatypes import List, Range
 from rapidfireai.automl.grid_search import recursive_expand_gridsearch
 from rapidfireai.automl.random_search import RFRandomSearch, recursive_expand_randomsearch
@@ -1759,6 +1760,351 @@ class TestReplacementFeasibility:
         callback._set_initial_trials({}, spawned=2)
         callback.set_context_feasibility(lambda leaf: True)
         assert callback._maybe_suggest_replacement() is None
+
+
+class TestShadowTPEInterimEvidence:
+    """Issue #304 contracts for the intended shadow-study/replacement helpers.
+
+    Look up helpers inside tests so their absence does not break collection
+    of the existing tests. All evidence fixtures use public Optuna APIs.
+    """
+
+    @staticmethod
+    def _running_study(values):
+        study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=42))
+        for x, value in zip((0.1, 0.3, 0.7, 0.9), values):
+            study.add_trial(optuna.trial.create_trial(
+                state=optuna.trial.TrialState.RUNNING,
+                params={"x": x},
+                distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0)},
+                intermediate_values={1: value},
+            ))
+        return study
+
+    @staticmethod
+    def _suggestions(study):
+        template = {"x": Range(0.0, 1.0)}
+        space = _extract_search_space(template)
+        return [
+            _sample_from_trial_multi(
+                optuna_search._build_interim_tpe_study(study, step=1, seed=seed).ask(),
+                [template], [space],
+            )["x"]
+            for seed in range(8)
+        ]
+
+    @pytest.mark.parametrize("direction", ["minimize", "maximize"])
+    def test_exact_step_evidence_and_main_study_immutability(self, direction):
+        state = optuna.trial.TrialState
+        study = optuna.create_study(
+            direction=direction, sampler=optuna.samplers.TPESampler(seed=42),
+        )
+        distribution = optuna.distributions.IntDistribution(0, 20)
+        rows = [
+            (state.RUNNING, {1: 10.0}),
+            (state.RUNNING, {1: 20.0, 2: -999.0}),
+            (state.PRUNED, {1: 30.0, 2: -999.0}),
+            (state.COMPLETE, {1: 40.0, 2: -999.0}),
+            (state.FAIL, {1: 50.0}),
+            (state.RUNNING, {0: 70.0}),
+            (state.RUNNING, {2: 80.0}),
+            (state.RUNNING, {1: float("nan")}),
+            (state.PRUNED, {1: float("inf")}),
+            (state.COMPLETE, {1: -float("inf")}),
+        ]
+        for x, (trial_state, intermediates) in enumerate(rows):
+            study.add_trial(optuna.trial.create_trial(
+                state=trial_state,
+                params={"x": x},
+                distributions={"x": distribution},
+                intermediate_values=intermediates,
+                value=-1000.0 if trial_state == state.COMPLETE else None,
+            ))
+        # The replacement call happens after tell(PRUNED), so include this trial.
+        just_pruned = study.ask(fixed_distributions={"x": distribution})
+        just_pruned.report(90.0, step=1)
+        study.tell(just_pruned, state=state.PRUNED)
+        # Add WAITING after ask(), which would otherwise consume the queued trial.
+        study.add_trial(optuna.trial.create_trial(
+            state=state.WAITING,
+            params={"x": 20},
+            distributions={"x": distribution},
+            intermediate_values={1: 60.0},
+        ))
+        before = study.get_trials(deepcopy=True)
+
+        shadow = optuna_search._build_interim_tpe_study(study, step=1, seed=42)
+
+        assert shadow.direction == study.direction
+        evidence = shadow.get_trials()
+        assert [(t.params, t.value) for t in evidence] == [
+            ({"x": 0}, 10.0), ({"x": 1}, 20.0),
+            ({"x": 2}, 30.0), ({"x": 3}, 40.0),
+            (just_pruned.params, 90.0),
+        ]
+        assert all(t.state == state.COMPLETE for t in evidence)
+        assert all(t.distributions == {"x": distribution} for t in evidence)
+        assert study.get_trials(deepcopy=True) == before
+
+    def test_empty_shadow_uses_zero_startup_tpe(self):
+        study = optuna.create_study()
+        for seed in range(3):
+            shadow = optuna_search._build_interim_tpe_study(study, step=1, seed=seed)
+            reference = optuna.create_study(
+                sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=0),
+            )
+            assert isinstance(shadow.sampler, optuna.samplers.TPESampler)
+            assert shadow.get_trials() == []
+            assert shadow.ask().suggest_float("x", 0.0, 1.0) == (
+                reference.ask().suggest_float("x", 0.0, 1.0)
+            )
+        assert study.get_trials() == []
+
+    def test_running_rankings_influence_tpe_before_default_startup(self):
+        # Four observations are below TPESampler's default startup of ten.
+        ascending = self._running_study([0.0, 1.0, 2.0, 3.0])
+        descending = self._running_study([3.0, 2.0, 1.0, 0.0])
+
+        first = self._suggestions(ascending)
+        reversed_rankings = self._suggestions(descending)
+
+        assert first == self._suggestions(ascending)
+        assert reversed_rankings == self._suggestions(descending)
+        assert first != reversed_rankings
+
+    def test_later_intermediates_and_final_values_do_not_affect_suggestions(self):
+        original = self._running_study([0.0, 1.0, 2.0, 3.0])
+        changed = optuna.create_study()
+        for trial in original.get_trials():
+            changed.add_trial(optuna.trial.create_trial(
+                state=optuna.trial.TrialState.COMPLETE,
+                params=trial.params,
+                distributions=trial.distributions,
+                intermediate_values={1: trial.intermediate_values[1], 2: -100.0},
+                value=-1000.0,
+            ))
+        changed.add_trial(optuna.trial.create_trial(
+            state=optuna.trial.TrialState.RUNNING,
+            params={"x": 0.5},
+            distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0)},
+            intermediate_values={2: -10000.0},
+        ))
+
+        assert self._suggestions(original) == self._suggestions(changed)
+
+    def test_replacement_transfers_params_without_completing_main_evidence(self):
+        study = self._running_study([0.0, 1.0, 2.0, 3.0])
+        template = {"x": Range(0.0, 1.0), "kind": List(["a", "b"])}
+        space = _extract_search_space(template)
+        before = study.get_trials(deepcopy=True)
+        shadow = optuna_search._build_interim_tpe_study(study, step=1, seed=42)
+        shadow_trial = shadow.ask()
+        expected = _sample_from_trial_multi(shadow_trial, [template], [space])
+
+        main_trial, sampled = optuna_search._sample_replacement(
+            study, [template], [space], range_cache={}, step=1, shadow_seed=42,
+        )
+
+        assert sampled == expected
+        assert main_trial.params == shadow_trial.params
+        assert main_trial.distributions == shadow_trial.distributions
+        after = study.get_trials(deepcopy=True)
+        assert after[:-1] == before
+        assert len(after) == len(before) + 1
+        assert after[-1].number == main_trial.number
+        assert after[-1].params == shadow_trial.params
+        assert after[-1].distributions == shadow_trial.distributions
+        assert all(t.state == optuna.trial.TrialState.RUNNING for t in after)
+        main_trial.report(0.25, step=0)
+        assert study.get_trials()[-1].intermediate_values == {0: 0.25}
+        study.tell(main_trial, 0.25)
+        assert study.best_trial.number == main_trial.number
+
+    @pytest.mark.parametrize("sampler_name,directions", [
+        ("random", ["minimize"]),
+        ("cmaes", ["minimize"]),
+        ("tpe", ["minimize", "maximize"]),
+    ])
+    def test_unsupported_studies_bypass_shadow(self, monkeypatch, sampler_name, directions):
+        sampler_type = {
+            "random": optuna.samplers.RandomSampler,
+            "cmaes": optuna.samplers.CmaEsSampler,
+            "tpe": optuna.samplers.TPESampler,
+        }[sampler_name]
+        study = optuna.create_study(directions=directions, sampler=sampler_type(seed=42))
+        # A singleton needs no CMA-ES optimizer/backend dependency.
+        template = {"x": List([0.5])}
+
+        def unexpected_shadow(*args, **kwargs):
+            pytest.fail("Only single-objective TPE may use shadow evidence")
+
+        monkeypatch.setattr(optuna_search, "_build_interim_tpe_study", unexpected_shadow)
+        main_trial, sampled = optuna_search._sample_replacement(
+            study, [template], [_extract_search_space(template)],
+            range_cache={}, step=1, shadow_seed=42,
+        )
+
+        assert sampled == {"x": 0.5}
+        trials = study.get_trials()
+        assert len(trials) == 1
+        assert trials[0].number == main_trial.number
+        assert trials[0].params == {"x": 0.5}
+        assert trials[0].state == optuna.trial.TrialState.RUNNING
+
+
+class TestShadowTPECallbackIntegration:
+    @staticmethod
+    def _callback(mode, seed=17, multi=False, sampler=None):
+        study = optuna.create_study(
+            directions=["minimize", "minimize"] if multi else ["minimize"],
+            sampler=sampler or optuna.samplers.TPESampler(seed=17),
+            pruner=optuna.pruners.ThresholdPruner(upper=0.5),
+        )
+        template = (
+            _fit_template_for_shard_callback_tests() if mode == "fit"
+            else {"pipeline": {"lr": Range(0.0, 1.0)}}
+        )
+        kwargs = dict(
+            study=study, search_spaces=[
+                [("lr", template.lr)] if mode == "fit" else _extract_search_space(template)
+            ],
+            config_templates=[template], budget=5, objective_metric="loss",
+            objective_metrics=["loss", "cost"] if multi else ["loss"],
+            directions=["minimize", "minimize"] if multi else ["minimize"],
+            shadow_tpe_seed=seed,
+        )
+        callback = (
+            OptunaFitShardCallback(**kwargs, trainer_type="SFT") if mode == "fit"
+            else OptunaShardCallback(**kwargs)
+        )
+        trial = study.ask()
+        _sample_from_trial_multi(trial, [template], kwargs["search_spaces"])
+        callback._set_initial_trials({1: trial}, spawned=1)
+        return callback, study
+
+    @staticmethod
+    def _spy(monkeypatch):
+        calls = []
+        original = optuna_search._sample_replacement
+
+        def sample(*args, **kwargs):
+            result = original(*args, **kwargs)
+            calls.append((kwargs["step"], kwargs["shadow_seed"], result[0]))
+            return result
+
+        monkeypatch.setattr(optuna_search, "_sample_replacement", sample)
+        return calls
+
+    @pytest.mark.parametrize("mode", ["fit", "evals"])
+    def test_pruning_tracks_real_trial_at_exact_boundary(self, monkeypatch, mode):
+        callback, study = self._callback(mode)
+        calls = self._spy(monkeypatch)
+        assert callback.on_shard_complete(1, 0, {"loss": 0.25}).action == "continue"
+        # Fit shard_id may cycle across epochs; cumulative step must still be 1.
+        shard_id = 0 if mode == "fit" else 4
+        decision = callback.on_shard_complete(1, shard_id, {"loss": 1.0})
+
+        assert decision.action == "prune"
+        assert decision.replacement_config is not None
+        assert [(step, seed) for step, seed, _ in calls] == [(1 if mode == "fit" else 4, 17)]
+        pending = [trial for key, trial in callback._trials.items() if isinstance(key, str)]
+        assert pending == [calls[0][2]]
+        trials = study.get_trials()
+        assert [trial.state for trial in trials] == [
+            optuna.trial.TrialState.PRUNED, optuna.trial.TrialState.RUNNING,
+        ]
+        assert pending[0].params == trials[-1].params
+        leaf = decision.replacement_config
+        assert (leaf["additional_kwargs"]["lr"] if mode == "fit" else leaf["pipeline"]["lr"]) == (
+            pending[0].params["lr" if mode == "fit" else "pipeline.lr"]
+        )
+        callback._remap_pending_trial(2)
+        callback.on_shard_complete(2, 0, {"loss": 0.1})
+        assert study.get_trials()[-1].intermediate_values == {0: 0.1}
+
+    def test_evals_rejection_advances_seed_but_not_budget(self, monkeypatch):
+        callback, study = self._callback("evals", seed=2**32 - 1)
+        calls = self._spy(monkeypatch)
+        callback.set_context_feasibility(lambda leaf: len(calls) > 1)
+        with pytest.warns(UserWarning, match="rejected a suggested config"):
+            decision = callback.on_shard_complete(1, 3, {"loss": 1.0})
+
+        assert decision.replacement_config is not None
+        assert [(step, seed) for step, seed, _ in calls] == [(3, 2**32 - 1), (3, 0)]
+        assert [trial.state for trial in study.get_trials()] == [
+            optuna.trial.TrialState.PRUNED, optuna.trial.TrialState.FAIL,
+            optuna.trial.TrialState.RUNNING,
+        ]
+        assert callback._spawned == 2
+        pending = [trial for key, trial in callback._trials.items() if isinstance(key, str)]
+        assert pending == [calls[1][2]]
+        callback._maybe_suggest_replacement(step=3)
+        assert calls[-1][1] == 1
+
+    @pytest.mark.parametrize("mode", ["fit", "evals"])
+    @pytest.mark.parametrize("bypass", ["disabled", "multi", "random", "cmaes"])
+    def test_bypass_does_not_build_shadow_or_advance_counter(self, monkeypatch, mode, bypass):
+        sampler = {
+            "random": optuna.samplers.RandomSampler,
+            "cmaes": optuna.samplers.CmaEsSampler,
+        }.get(bypass)
+        callback, study = self._callback(
+            mode, seed=None if bypass == "disabled" else 17,
+            multi=bypass == "multi", sampler=sampler(seed=17) if sampler else None,
+        )
+
+        def unexpected(*args, **kwargs):
+            pytest.fail("Bypassed replacements must not build a shadow study")
+
+        monkeypatch.setattr(optuna_search, "_build_interim_tpe_study", unexpected)
+        assert callback._maybe_suggest_replacement(step=2) is not None
+        assert callback._shadow_tpe_attempts == 0
+        assert all(t.state == optuna.trial.TrialState.RUNNING for t in study.get_trials())
+
+    @pytest.mark.parametrize("mode", ["fit", "evals"])
+    def test_multi_objective_pruning_bypasses_shadow(self, monkeypatch, mode):
+        callback, study = self._callback(mode, multi=True)
+        calls = self._spy(monkeypatch)
+        callback._trials[2] = study.ask()
+        callback._spawned = 2
+        callback.on_shard_complete(2, 0, {"loss": 0.1, "cost": 0.1})
+        decision = callback.on_shard_complete(1, 0, {"loss": 1.0, "cost": 1.0})
+        assert decision.action == "prune"
+        assert decision.replacement_config is not None
+        assert [(step, seed) for step, seed, _ in calls] == [(None, None)]
+        assert callback._shadow_tpe_attempts == 0
+        assert study.get_trials()[-1].state == optuna.trial.TrialState.RUNNING
+
+    @pytest.mark.parametrize("mode", ["fit", "evals"])
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_rfoptuna_passes_opt_in_constructor_seed(self, mode, enabled):
+        from rapidfireai.automl.model_config import RFModelConfig
+
+        config = (
+            RFModelConfig(model_name="m", model_kwargs={"x": Range(0.0, 1.0)})
+            if mode == "fit" else {"x": Range(0.0, 1.0)}
+        )
+        rf = RFOptuna(
+            configs=config, trainer_type="SFT" if mode == "fit" else None,
+            n_initial=1, seed=23, interim_tpe=enabled,
+        )
+        rf.get_runs(seed=99)
+        assert rf.get_callback()._shadow_tpe_seed == (23 if enabled else None)
+
+    def test_default_disabled_and_initial_sampling_unchanged(self):
+        def initial(**kwargs):
+            rf = RFOptuna(
+                configs={"pipeline": {"x": Range(0.0, 1.0)}},
+                n_initial=2, seed=23, **kwargs,
+            )
+            runs = rf.get_runs()
+            return rf, runs
+
+        default, runs = initial()
+        enabled, shadow_runs = initial(interim_tpe=True)
+        assert default.interim_tpe is False
+        assert default.get_callback()._shadow_tpe_seed is None
+        assert runs == shadow_runs
 
 
 class TestRandomSearchReproducibility:

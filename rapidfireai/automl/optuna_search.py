@@ -719,6 +719,77 @@ def _sample_from_trial_multi(
 
 
 # ---------------------------------------------------------------------------
+# Experimental shadow-TPE replacement sampling
+# ---------------------------------------------------------------------------
+
+
+def _build_interim_tpe_study(
+    main_study: optuna.Study,
+    step: int,
+    seed: int,
+) -> optuna.Study:
+    """Copy finite, exact-step evidence into a disposable single-objective study."""
+    shadow = optuna.create_study(
+        direction=main_study.direction,
+        sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=0),
+    )
+    for trial in main_study.get_trials(
+        deepcopy=True,
+        states=(
+            optuna.trial.TrialState.RUNNING,
+            optuna.trial.TrialState.PRUNED,
+            optuna.trial.TrialState.COMPLETE,
+        ),
+    ):
+        value = trial.intermediate_values.get(step)
+        if value is None or not math.isfinite(value):
+            continue
+        shadow.add_trial(optuna.trial.create_trial(
+            state=optuna.trial.TrialState.COMPLETE,
+            params=dict(trial.params),
+            distributions=dict(trial.distributions),
+            value=value,
+        ))
+    return shadow
+
+
+def _sample_replacement(
+    main_study: optuna.Study,
+    config_templates: list[Any],
+    search_spaces: list[list[tuple[str, Range | List]]],
+    *,
+    range_cache: dict[int, list] | None = None,
+    step: int | None = None,
+    shadow_seed: int | None = None,
+) -> tuple[optuna.Trial, Any]:
+    """Sample a config and return its real main-study trial for lifecycle tracking.
+
+    Shadow sampling is opt-in via ``shadow_seed`` and ``step``. Transferring
+    its proposal assumes serialized study access and no existing queued trials.
+    """
+    if (
+        shadow_seed is None
+        or step is None
+        or len(main_study.directions) != 1
+        or not isinstance(main_study.sampler, optuna.samplers.TPESampler)
+    ):
+        main_trial = main_study.ask()
+        sampled = _sample_from_trial_multi(
+            main_trial, config_templates, search_spaces, range_cache=range_cache,
+        )
+        return main_trial, sampled
+
+    shadow = _build_interim_tpe_study(main_study, step, shadow_seed)
+    shadow_trial = shadow.ask()
+    sampled = _sample_from_trial_multi(
+        shadow_trial, config_templates, search_spaces, range_cache=range_cache,
+    )
+    main_study.enqueue_trial(dict(shadow_trial.params))
+    main_trial = main_study.ask(fixed_distributions=dict(shadow_trial.distributions))
+    return main_trial, sampled
+
+
+# ---------------------------------------------------------------------------
 # Helpers to expand a sampled config template into a config leaf
 # (mirrors the expansion in grid_search / random_search)
 # ---------------------------------------------------------------------------
@@ -1028,6 +1099,7 @@ class OptunaFitShardCallback:
         objective_metrics: list[str] | None = None,
         directions: list[str] | None = None,
         range_cache: dict[int, list] | None = None,
+        shadow_tpe_seed: int | None = None,
     ):
         if granularity not in ("shard", "epoch"):
             raise AutoMLException(
@@ -1050,6 +1122,9 @@ class OptunaFitShardCallback:
         self._granularity = granularity
         self._num_shards = num_shards
         self._range_cache = range_cache
+        self._shadow_tpe_seed = shadow_tpe_seed
+        # Counts shadow candidates, including rejected Evals attempts, not accepted runs.
+        self._shadow_tpe_attempts = 0
         self._trials: dict[int, optuna.trial.Trial] = {}
         self._spawned = 0
         self._cumulative_step: dict[int, int] = {}
@@ -1148,7 +1223,7 @@ class OptunaFitShardCallback:
 
         if trial.should_prune() or self._should_prune_concurrent(trial):
             self._study.tell(trial, state=optuna.trial.TrialState.PRUNED)
-            replacement = self._maybe_suggest_replacement()
+            replacement = self._maybe_suggest_replacement(step=step)
             return RunDecision(action="prune", replacement_config=replacement)
 
         return RunDecision(action="continue")
@@ -1322,15 +1397,24 @@ class OptunaFitShardCallback:
         """
         return _resolve_scalar_for_objective(metrics, self._objective_metric)
 
-    def _maybe_suggest_replacement(self) -> dict[str, Any] | None:
+    def _maybe_suggest_replacement(self, step: int | None = None) -> dict[str, Any] | None:
         """Ask Optuna for a new trial and return a config leaf, or ``None`` if budget exhausted."""
         if self._spawned >= self._budget:
             return None
 
-        new_trial = self._study.ask()
-        config_obj = _sample_from_trial_multi(
-            new_trial, self._config_templates, self._search_spaces,
-            range_cache=self._range_cache,
+        shadow_seed = None
+        if (
+            self._shadow_tpe_seed is not None
+            and step is not None
+            and not self._is_multi_objective
+            and len(self._study.directions) == 1
+            and isinstance(self._study.sampler, optuna.samplers.TPESampler)
+        ):
+            shadow_seed = (self._shadow_tpe_seed + self._shadow_tpe_attempts) % (2**32)
+            self._shadow_tpe_attempts += 1
+        new_trial, config_obj = _sample_replacement(
+            self._study, self._config_templates, self._search_spaces,
+            range_cache=self._range_cache, step=step, shadow_seed=shadow_seed,
         )
         leaf = _template_to_leaf_fit(config_obj, self._trainer_type)
 
@@ -1391,6 +1475,7 @@ class OptunaShardCallback:
         objective_metrics: list[str] | None = None,
         directions: list[str] | None = None,
         range_cache: dict[int, list] | None = None,
+        shadow_tpe_seed: int | None = None,
     ):
         self._study = study
         self._search_spaces = search_spaces
@@ -1401,6 +1486,9 @@ class OptunaShardCallback:
         self._directions = directions or ["minimize"]
         self._is_multi_objective = len(self._objective_metrics) > 1
         self._range_cache = range_cache
+        self._shadow_tpe_seed = shadow_tpe_seed
+        # Counts shadow candidates, including rejected Evals attempts, not accepted runs.
+        self._shadow_tpe_attempts = 0
         self._trials: dict[int, optuna.trial.Trial] = {}
         self._spawned = 0
         self._multi_intermediates: dict[int, dict[int, list[float]]] = {}
@@ -1482,7 +1570,7 @@ class OptunaShardCallback:
 
         if trial.should_prune() or self._should_prune_concurrent(trial):
             self._study.tell(trial, state=optuna.trial.TrialState.PRUNED)
-            replacement = self._maybe_suggest_replacement()
+            replacement = self._maybe_suggest_replacement(step=shard_id)
             return PipelineDecision(action="prune", replacement_config=replacement)
 
         return PipelineDecision(action="continue")
@@ -1618,7 +1706,7 @@ class OptunaShardCallback:
         """
         self._context_feasibility = predicate
 
-    def _maybe_suggest_replacement(self) -> dict[str, Any] | None:
+    def _maybe_suggest_replacement(self, step: int | None = None) -> dict[str, Any] | None:
         """Ask Optuna for a new trial and return an evals config leaf.
 
         Returns ``None`` when the budget is exhausted, or when every attempt
@@ -1631,10 +1719,19 @@ class OptunaShardCallback:
             return None
 
         for _ in range(_MAX_REPLACEMENT_ATTEMPTS):
-            new_trial = self._study.ask()
-            config_dict = _sample_from_trial_multi(
-                new_trial, self._config_templates, self._search_spaces,
-                range_cache=self._range_cache,
+            shadow_seed = None
+            if (
+                self._shadow_tpe_seed is not None
+                and step is not None
+                and not self._is_multi_objective
+                and len(self._study.directions) == 1
+                and isinstance(self._study.sampler, optuna.samplers.TPESampler)
+            ):
+                shadow_seed = (self._shadow_tpe_seed + self._shadow_tpe_attempts) % (2**32)
+                self._shadow_tpe_attempts += 1
+            new_trial, config_dict = _sample_replacement(
+                self._study, self._config_templates, self._search_spaces,
+                range_cache=self._range_cache, step=step, shadow_seed=shadow_seed,
             )
             leaf = _template_to_leaf_evals(config_dict)
 
@@ -1776,6 +1873,9 @@ class RFOptuna(AutoMLAlgorithm):
         set of indexes must be finite and known before any query runs: each is
         drawn down to ``Range.sample_n`` distinct values by ``sample(n)``.
         ``seed`` selects which part of the range this run explores.
+    interim_tpe : bool
+        Experimental, disabled by default. Use step-aligned interim evidence
+        for single-objective TPE replacements; initial sampling is unchanged.
 
     Methods
     -------
@@ -1805,6 +1905,7 @@ class RFOptuna(AutoMLAlgorithm):
         seed: int = 42,
         granularity: str = "shard",
         build_all_indexes: bool = True,
+        interim_tpe: bool = False,
     ):
         if granularity not in ("shard", "epoch"):
             raise AutoMLException(
@@ -1819,6 +1920,7 @@ class RFOptuna(AutoMLAlgorithm):
         self._seed = seed
         self._granularity = granularity
         self.build_all_indexes = build_all_indexes
+        self.interim_tpe = interim_tpe
 
         self._study: optuna.Study | None = None
         self._callback: OptunaFitShardCallback | OptunaShardCallback | None = None
@@ -1969,6 +2071,7 @@ class RFOptuna(AutoMLAlgorithm):
                 objective_metrics=self._objective_metrics,
                 directions=self._directions,
                 range_cache=self._range_value_cache,
+                shadow_tpe_seed=self._seed if self.interim_tpe else None,
             )
         else:
             cb = OptunaShardCallback(
@@ -1980,6 +2083,7 @@ class RFOptuna(AutoMLAlgorithm):
                 objective_metrics=self._objective_metrics,
                 directions=self._directions,
                 range_cache=self._range_value_cache,
+                shadow_tpe_seed=self._seed if self.interim_tpe else None,
             )
 
         self._callback = cb
