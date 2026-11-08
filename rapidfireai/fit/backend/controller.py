@@ -825,6 +825,7 @@ class Controller:
 
                 # Process completed and failed tasks by run
                 completed_runs = set()
+                completed_shards = {}
                 failed_runs = set()
 
                 for worker_id, worker_task in all_worker_tasks.items():
@@ -848,6 +849,7 @@ class Controller:
                         and run_id in active_runs
                     ):
                         completed_runs.add(run_id)
+                        completed_shards[run_id] = worker_task["shard_id"]
                     elif (
                         worker_task["status"] == TaskStatus.FAILED
                         and run_id in active_runs
@@ -856,7 +858,7 @@ class Controller:
 
                 # Process completed tasks first (before scheduling new ones)
                 for run_id in completed_runs:
-                    shard_id = worker_task["shard_id"]
+                    shard_id = completed_shards[run_id]
                     run_details = all_run_details[run_id]
                     self.logger.debug(
                         f"Completed task: run {run_id}, shard {shard_id} on workers {active_runs[run_id]}"
